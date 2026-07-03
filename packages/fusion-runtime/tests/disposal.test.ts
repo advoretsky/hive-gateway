@@ -1,7 +1,9 @@
 import { getUnifiedGraphGracefully } from '@graphql-mesh/fusion-composition';
 import { createDefaultExecutor } from '@graphql-tools/delegate';
+import { normalizedExecutor } from '@graphql-tools/executor';
 import { createDeferred, type Executor } from '@graphql-tools/utils';
 import { DisposableSymbols } from '@whatwg-node/disposablestack';
+import { parse, type GraphQLError } from 'graphql';
 import { createSchema } from 'graphql-yoga';
 import { describe, expect, it, vi } from 'vitest';
 import { handleFederationSupergraph } from '../src/federation/supergraph';
@@ -79,5 +81,80 @@ describe('UnifiedGraphManager disposal', () => {
 
     expect(executorDisposeFns).toHaveLength(2);
     expect(executorDisposeFns[1]).toHaveBeenCalled();
+  });
+
+  it('keeps the SHUTTING_DOWN abort reason when a pending load fails during shutdown', async () => {
+    const subgraphSchema = createSchema({
+      typeDefs: /* GraphQL */ `
+        type Query {
+          hello: String
+        }
+      `,
+      resolvers: {
+        Query: {
+          hello: () => 'hi',
+        },
+      },
+    });
+    const sdl = getUnifiedGraphGracefully([
+      { name: 'Test', schema: subgraphSchema },
+    ]);
+
+    let loads = 0;
+    const secondLoad = createDeferred<string>();
+    let capturedGetDisposeReason: (() => GraphQLError | undefined) | undefined;
+
+    const manager = new UnifiedGraphManager({
+      getUnifiedGraph: () => {
+        loads++;
+        if (loads === 1) {
+          return sdl;
+        }
+        return secondLoad.promise;
+      },
+      transports() {
+        return {
+          getSubgraphExecutor(payload) {
+            // The reason consulted when this transport's in-flight requests
+            // are aborted at disposal time.
+            capturedGetDisposeReason = payload.getDisposeReason;
+            return createDefaultExecutor(subgraphSchema);
+          },
+        };
+      },
+    });
+
+    // Execute once so the transport is instantiated for the generation. Under
+    // the router runtime, execution goes through the manager's executor
+    // rather than the schema's own resolvers.
+    const schema = await manager.getUnifiedGraph();
+    const contextValue = await manager.getContext({});
+    const document = parse(/* GraphQL */ `
+      {
+        hello
+      }
+    `);
+    const executor = await manager.getExecutor();
+    const result = await (executor
+      ? executor({ document, context: contextValue })
+      : normalizedExecutor({ schema, document, contextValue }));
+    if (Symbol.asyncIterator in result) {
+      throw new Error('unexpected incremental result');
+    }
+    expect(result.data?.hello).toBe('hi');
+    expect(capturedGetDisposeReason).toBeDefined();
+
+    // A reload is in flight when shutdown starts, and it FAILS afterwards: the
+    // failure must not erase the SHUTTING_DOWN reason that in-flight subgraph
+    // requests are aborted with.
+    const reload$ = manager.invalidateUnifiedGraph();
+    const disposed$ = manager[DisposableSymbols.asyncDispose]();
+    secondLoad.reject(new Error('schema registry unavailable'));
+    await expect(reload$).rejects.toThrow('schema registry unavailable');
+    await disposed$;
+
+    expect(capturedGetDisposeReason!()?.extensions?.['code']).toBe(
+      'SHUTTING_DOWN',
+    );
   });
 });

@@ -377,7 +377,10 @@ export class UnifiedGraphManager<TContext> implements AsyncDisposable {
     return this.unifiedGraph;
   }
 
-  private disposeReason: GraphQLError | undefined;
+  /** Abort reason for shutdown. Written exactly once, in asyncDispose, and
+   * never cleared — per-reload abort reasons live on each generation's own
+   * `disposeReason` instead. */
+  private shutdownReason: GraphQLError | undefined;
 
   private handleLoadedUnifiedGraph(
     loadedUnifiedGraph: string | GraphQLSchema | DocumentNode,
@@ -515,10 +518,10 @@ export class UnifiedGraphManager<TContext> implements AsyncDisposable {
             getSubgraphSchema,
             transportExecutorStack,
             // Each generation aborts its own in-flight requests with its own
-            // reason; `this.disposeReason` carries the shutdown reason, which
+            // reason; `this.shutdownReason` carries the shutdown reason, which
             // applies to every generation.
             getDisposeReason: () =>
-              generation.disposeReason ?? this.disposeReason,
+              generation.disposeReason ?? this.shutdownReason,
             batch: this.batch,
             instrumentation: () => this.instrumentation(),
           });
@@ -560,7 +563,6 @@ export class UnifiedGraphManager<TContext> implements AsyncDisposable {
         `Failed to fetch the supergraph, check your supergraph configuration.`,
       );
     }
-    this.disposeReason = undefined;
     this.polling$ = undefined;
     this.lastLoadTime = Date.now();
     return this.unifiedGraph;
@@ -738,7 +740,6 @@ export class UnifiedGraphManager<TContext> implements AsyncDisposable {
       (err) => {
         this.opts.transportContext?.log.error(err, 'Failed to load Supergraph');
         this.lastLoadTime = Date.now();
-        this.disposeReason = undefined;
         this.polling$ = undefined;
         if (!this.unifiedGraph) {
           throw err;
@@ -832,7 +833,7 @@ export class UnifiedGraphManager<TContext> implements AsyncDisposable {
 
   [DisposableSymbols.asyncDispose]() {
     this.disposed = true;
-    this.disposeReason = createGraphQLError(
+    this.shutdownReason = createGraphQLError(
       'operation has been aborted because the server is shutting down',
       {
         extensions: {
@@ -858,7 +859,7 @@ export class UnifiedGraphManager<TContext> implements AsyncDisposable {
       }
       generation.disposed = true;
       // Clear any per-generation SCHEMA_RELOAD reason so in-flight work on a
-      // draining generation aborts with SHUTTING_DOWN (via the `?? this.disposeReason`
+      // draining generation aborts with SHUTTING_DOWN (via the `?? this.shutdownReason`
       // fallback) rather than SCHEMA_RELOAD — otherwise clients might retry into
       // a shutting-down gateway instead of failing over.
       generation.disposeReason = undefined;
