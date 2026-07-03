@@ -283,9 +283,20 @@ export class UnifiedGraphManager<TContext> implements AsyncDisposable {
   /** Set once the manager is disposed, so a supergraph load that resolves
    * mid- or post-shutdown does not resurrect manager state. */
   private disposed = false;
+  /** Cap on concurrently live generations, normalized once from the options. */
+  private readonly maxConcurrentGenerations: number;
 
   constructor(private opts: UnifiedGraphManagerOptions<TContext>) {
     this.batch = opts.batch ?? true;
+    // Fall back to the default for any invalid value (including NaN, which
+    // would make `size + 1 > cap` always false and silently disable the cap).
+    const configuredCap = opts.maxConcurrentSchemaGenerations;
+    this.maxConcurrentGenerations =
+      typeof configuredCap === 'number' &&
+      Number.isFinite(configuredCap) &&
+      configuredCap >= 1
+        ? configuredCap
+        : DEFAULT_MAX_CONCURRENT_GENERATIONS;
     this.handleUnifiedGraph =
       opts.handleUnifiedGraph ||
       (usingHiveRouterRuntime()
@@ -665,15 +676,8 @@ export class UnifiedGraphManager<TContext> implements AsyncDisposable {
     generation.forceDisposeTimer = forceDisposeTimer;
     // Enforce the cap after registering this generation; if it is exceeded the
     // oldest draining generation is force-disposed immediately — the cap takes
-    // precedence over its drain timer. Fall back to the default for any invalid
-    // value (including NaN, which would make `size + 1 > cap` always false and
-    // silently disable the cap).
-    const configuredCap = this.opts.maxConcurrentSchemaGenerations;
-    const maxGenerations =
-      Number.isFinite(configuredCap) && (configuredCap as number) >= 1
-        ? (configuredCap as number)
-        : DEFAULT_MAX_CONCURRENT_GENERATIONS;
-    this.enforceGenerationCap(maxGenerations);
+    // precedence over its drain timer.
+    this.enforceGenerationCap();
     return undefined;
   }
 
@@ -681,16 +685,14 @@ export class UnifiedGraphManager<TContext> implements AsyncDisposable {
    * Force-dispose the oldest draining generations until the number of live
    * generations (the current one plus draining ones) is within the cap.
    */
-  private enforceGenerationCap(maxConcurrentGenerations: number): void {
+  private enforceGenerationCap(): void {
     // Sets iterate in insertion order, so the first draining generation is the
     // oldest. With a cap of 1 the only draining entry is the one just retired,
-    // so it is force-disposed here — i.e. overlap is effectively off. The guard
-    // also handles a non-positive cap (drain everything).
-    while (this.drainingGenerations.size + 1 > maxConcurrentGenerations) {
-      const oldest = this.drainingGenerations.values().next().value;
-      if (!oldest) {
-        break;
-      }
+    // so it is force-disposed here — i.e. overlap is effectively off. The cap
+    // is >= 1, so whenever the loop runs the set is non-empty (each disposal
+    // removes the generation from the set synchronously).
+    while (this.drainingGenerations.size + 1 > this.maxConcurrentGenerations) {
+      const oldest = this.drainingGenerations.values().next().value!;
       void this.forceDisposeGeneration(oldest);
     }
   }
