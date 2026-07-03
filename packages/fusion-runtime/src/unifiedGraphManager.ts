@@ -280,6 +280,9 @@ export class UnifiedGraphManager<TContext> implements AsyncDisposable {
   /** Latch so the "schema not tracked → graceful reload has no effect" warning
    * is emitted at most once instead of per request. */
   private warnedUntrackedSchema = false;
+  /** Set once the manager is disposed, so a supergraph load that resolves
+   * mid- or post-shutdown does not resurrect manager state. */
+  private disposed = false;
 
   constructor(private opts: UnifiedGraphManagerOptions<TContext>) {
     this.batch = opts.batch ?? true;
@@ -324,6 +327,11 @@ export class UnifiedGraphManager<TContext> implements AsyncDisposable {
     }
     if (!this.unifiedGraph) {
       if (!this.initialUnifiedGraph$) {
+        // A request arriving after dispose revives the manager with a fresh
+        // initial load (supported; see the gateway runtime's onSchemaChange
+        // tests) — only loads that were already in flight when the manager was
+        // disposed stay dropped.
+        this.disposed = false;
         this.opts?.transportContext?.log.debug(
           'Fetching the initial Supergraph',
         );
@@ -480,6 +488,16 @@ export class UnifiedGraphManager<TContext> implements AsyncDisposable {
           executor,
           overrideLabels,
         }) => {
+          if (this.disposed) {
+            // The manager was disposed while this supergraph was loading.
+            // Installing the new generation would resurrect state (and leak
+            // its resources — nothing disposes them after shutdown), so tear
+            // down what the handler just built instead.
+            return handleMaybePromise(
+              () => disposeAll([executor]),
+              () => newUnifiedGraph,
+            );
+          }
           this.overrideLabels = overrideLabels;
           const transportExecutorStack = new AsyncDisposableStack();
           const generation: SchemaGeneration = {
@@ -813,6 +831,7 @@ export class UnifiedGraphManager<TContext> implements AsyncDisposable {
   }
 
   [DisposableSymbols.asyncDispose]() {
+    this.disposed = true;
     this.disposeReason = createGraphQLError(
       'operation has been aborted because the server is shutting down',
       {
